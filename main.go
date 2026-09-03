@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	gauthz "github.com/jack-work/gluck-authz"
 	"github.com/jack-work/gluck-herald/client"
-	"github.com/jack-work/gluck-herald/internal/auth"
 	"github.com/jack-work/gluck-herald/internal/authz"
 	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/server"
@@ -171,7 +171,7 @@ func runServe(args []string) error {
 		Store:    st,
 		Policy:   policy,
 		Routes:   routes,
-		Verifier: &auth.Verifier{JWKSURL: *jwksURL, Issuer: *issuer, ClientIDs: policy.Clients()},
+		Verifier: &gauthz.Verifier{JWKSURL: *jwksURL, Issuer: *issuer, ClientIDs: policy.Clients()},
 	})
 
 	httpSrv := &http.Server{

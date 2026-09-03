@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jack-work/gluck-herald/internal/auth"
+	gauthz "github.com/jack-work/gluck-authz"
 	"github.com/jack-work/gluck-herald/internal/authz"
 	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/store"
@@ -34,7 +34,7 @@ const MaxWait = 60 * time.Second
 type Config struct {
 	Bot      *tg.Client
 	Store    *store.Store
-	Verifier *auth.Verifier
+	Verifier *gauthz.Verifier
 	Policy   *authz.Policy
 	Routes   *route.Table
 }
@@ -46,7 +46,7 @@ type Server struct {
 	// verify and send are swappable so tests can exercise routing and
 	// authorization without re-testing the crypto that auth's own tests
 	// cover, and without a live Telegram.
-	verify func(context.Context, string) (*auth.Identity, error)
+	verify func(context.Context, string) (*gauthz.Identity, error)
 	send   func(context.Context, int64, string) error
 }
 
@@ -84,7 +84,7 @@ func (s *Server) need(role authz.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := s.verify(r.Context(), r.Header.Get("Authorization"))
 		if err != nil {
-			if errors.Is(err, auth.ErrNoToken) {
+			if errors.Is(err, gauthz.ErrNoToken) {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="herald"`)
 			}
 			log.Printf("auth refused from %s: %v", r.RemoteAddr, err)
@@ -109,11 +109,11 @@ func (s *Server) need(role authz.Role, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func identityOf(r *http.Request) *auth.Identity {
-	if id, ok := r.Context().Value(identityKey).(*auth.Identity); ok {
+func identityOf(r *http.Request) *gauthz.Identity {
+	if id, ok := r.Context().Value(identityKey).(*gauthz.Identity); ok {
 		return id
 	}
-	return &auth.Identity{}
+	return &gauthz.Identity{}
 }
 
 func logging(next http.Handler) http.Handler {

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jack-work/gluck-herald/internal/auth"
+	gauthz "github.com/jack-work/gluck-authz"
 	"github.com/jack-work/gluck-herald/internal/authz"
 	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/store"
@@ -19,16 +19,16 @@ import (
 // stubVerify accepts "Bearer <client_id>", so server tests exercise routing
 // and authorization rather than re-testing the crypto that auth's own tests
 // cover.
-func stubVerify(ctx context.Context, header string) (*auth.Identity, error) {
+func stubVerify(ctx context.Context, header string) (*gauthz.Identity, error) {
 	const p = "Bearer "
 	if !strings.HasPrefix(header, p) {
-		return nil, auth.ErrNoToken
+		return nil, gauthz.ErrNoToken
 	}
 	id := strings.TrimSpace(header[len(p):])
 	if id == "" || id == "bad" {
 		return nil, errBadToken
 	}
-	return &auth.Identity{Subject: "s-" + id, ClientID: id, Username: ""}, nil
+	return &gauthz.Identity{Subject: "s-" + id, ClientID: id, Username: ""}, nil
 }
 
 type badToken struct{}
