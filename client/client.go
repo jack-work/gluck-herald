@@ -1,11 +1,13 @@
-// Package client is herald's HTTP client: bearer auth with a single
-// refresh-and-retry on 401.
+// Package client talks to a herald server.
 //
-// The token comes from the environment (HERALD_TOKEN), which is how hush
-// brokers it — the CLI is deliberately credential-agnostic, so it can be
-// run under a hush shim, by hand with a token pasted in, or by a service
-// with the token loaded from a systemd credential. Nothing here knows what
-// a vault is.
+// This is the public surface other programs build on: the figaro bridge, the
+// calendar notifier, anything that wants to send you a message. Herald itself
+// knows nothing about them, which is the point — it is the Telegram API with
+// names and an inbox, and everything domain-specific is a caller.
+//
+// Credentials arrive through a TokenSource. The bundled EnvTokenSource reads
+// $HERALD_TOKEN, which is how hush brokers one; a service on spain uses
+// ClientCredentials instead. Nothing here knows what a vault is.
 package client
 
 import (
@@ -144,10 +146,23 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 	return nil
 }
 
-// Say sends a markdown message to a chat.
-func (c *Client) Say(ctx context.Context, chat int64, text string) error {
+// Say sends a markdown message to a named recipient.
+//
+// The name is resolved by the server against its declared routes, so a
+// caller never carries a chat id — and cannot reach a chat the deployment
+// has not declared.
+func (c *Client) Say(ctx context.Context, to, text string) error {
 	return c.do(ctx, http.MethodPost, "/v1/say",
-		map[string]any{"chat": chat, "text": text}, nil, true)
+		map[string]any{"to": to, "text": text}, nil, true)
+}
+
+// Routes lists the recipient names this server will accept.
+func (c *Client) Routes(ctx context.Context) ([]string, error) {
+	var out struct {
+		Routes []string `json:"routes"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/routes", nil, &out, true)
+	return out.Routes, err
 }
 
 type Message struct {
@@ -184,9 +199,9 @@ func (c *Client) Ack(ctx context.Context, through int64) error {
 
 type WhoAmI struct {
 	Subject  string   `json:"subject"`
+	ClientID string   `json:"client_id"`
 	Username string   `json:"username"`
-	Groups   []string `json:"groups"`
-	Scopes   []string `json:"scopes"`
+	Roles    []string `json:"roles"`
 }
 
 func (c *Client) WhoAmI(ctx context.Context) (*WhoAmI, error) {

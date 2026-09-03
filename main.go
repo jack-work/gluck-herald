@@ -1,8 +1,11 @@
-// Command herald is both halves of the message gateway: the server that
-// runs on spain and the CLI that talks to it.
+// Command herald is the message gateway: the Telegram Bot API with names
+// instead of chat ids, a durable inbox, and per-client authorization.
 //
-// One binary because the two share the wire types, and because a client
-// that drifts from its server is a class of bug worth designing out.
+// It is deliberately boring and deliberately ignorant. It knows nothing about
+// figaro, calendars, or anything else that might want to send you a message;
+// those live in their own modules and depend on this one's client package.
+// Herald's whole job is: take a name and some markdown, deliver it; take
+// what Telegram sends back, hold it until someone claims it.
 package main
 
 import (
@@ -14,37 +17,38 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/jack-work/gluck-herald/client"
 	"github.com/jack-work/gluck-herald/internal/auth"
-	"github.com/jack-work/gluck-herald/internal/client"
+	"github.com/jack-work/gluck-herald/internal/authz"
+	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/server"
 	"github.com/jack-work/gluck-herald/internal/store"
 	"github.com/jack-work/gluck-herald/internal/tg"
 )
 
-const usage = `herald — authenticated message gateway
+const usage = `herald — message gateway (telegram, with names)
 
-Server (on spain):
-  herald serve                     run the API and the telegram poller
+Server:
+  herald serve                        run the API and the telegram poller
 
 Client:
-  herald say [--chat N] <markdown> send a message (reads stdin with "-")
-  herald pump [--aria ID]          long-poll the inbox, route into figaro
-  herald inbox [--wait D]          print pending messages as JSON
-  herald whoami                    show the identity your token asserts
-  herald health                    server health (no auth)
+  herald say --to <name> <markdown>   send a message ("-" reads stdin)
+  herald inbox [--wait D]             print pending messages as JSON
+  herald ack --through <id>           drop messages through an id
+  herald routes                       list recipient names
+  herald whoami                       show what your token asserts
+  herald health                       server health (no auth)
 
 Client environment:
-  HERALD_API        base URL (default https://herald.kelliher.info)
-  HERALD_TOKEN      bearer token; normally injected by hush
-  HERALD_CHAT       default chat id for say
+  HERALD_API     base URL (default https://herald.kelliher.info)
+  HERALD_TOKEN   bearer token; normally injected by hush
+  HERALD_TO      default recipient name
 `
 
 func main() {
@@ -61,10 +65,12 @@ func main() {
 		err = runServe(os.Args[2:])
 	case "say":
 		err = runSay(os.Args[2:])
-	case "pump":
-		err = runPump(os.Args[2:])
 	case "inbox":
 		err = runInbox(os.Args[2:])
+	case "ack":
+		err = runAck(os.Args[2:])
+	case "routes":
+		err = runRoutes(os.Args[2:])
 	case "whoami":
 		err = runWhoAmI(os.Args[2:])
 	case "health":
@@ -112,11 +118,33 @@ func runServe(args []string) error {
 	statePath := fs.String("state", envOr("HERALD_STATE", defaultStatePath()), "state file")
 	jwksURL := fs.String("jwks", envOr("HERALD_JWKS", "http://127.0.0.1:9091/jwks.json"), "Authelia JWKS URL")
 	issuer := fs.String("issuer", envOr("HERALD_ISSUER", "https://auth.kelliher.info"), "expected token issuer")
-	clientIDs := fs.String("client-ids", envOr("HERALD_CLIENT_IDS", "herald"), "comma-separated OIDC client_id allowlist")
-	group := fs.String("group", envOr("HERALD_GROUP", ""), "required lldap group")
-	chats := fs.String("chats", envOr("HERALD_CHATS", ""), "comma-separated allowed telegram chat ids")
+	policyJSON := fs.String("policy", envOr("HERALD_POLICY", ""), `client roles, JSON: {"herald":["say","inbox","admin"]}`)
+	routesJSON := fs.String("routes", envOr("HERALD_ROUTES", ""), `recipient names, JSON: {"gluck":"487734915"}`)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	var policySpec map[string][]string
+	if err := json.Unmarshal([]byte(orEmptyJSON(*policyJSON)), &policySpec); err != nil {
+		return fmt.Errorf("--policy: %w", err)
+	}
+	policy, err := authz.NewPolicy(policySpec)
+	if err != nil {
+		return err
+	}
+
+	var routeSpec map[string]string
+	if err := json.Unmarshal([]byte(orEmptyJSON(*routesJSON)), &routeSpec); err != nil {
+		return fmt.Errorf("--routes: %w", err)
+	}
+	routes, err := route.NewTable(routeSpec)
+	if err != nil {
+		return err
+	}
+	if routes.Empty() {
+		// Refuse to run as an unaddressable gateway rather than start and
+		// reject everything at request time.
+		return fmt.Errorf("no routes declared: herald could neither send nor accept anything")
 	}
 
 	token, err := telegramToken()
@@ -137,31 +165,24 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	allowed := parseChats(*chats)
 
 	srv := server.New(server.Config{
-		Bot:   bot,
-		Store: st,
-		Verifier: &auth.Verifier{
-			JWKSURL:   *jwksURL,
-			Issuer:    *issuer,
-			ClientIDs: splitComma(*clientIDs),
-		},
-		RequiredGroup: *group,
-		AllowedChats:  allowed,
+		Bot:      bot,
+		Store:    st,
+		Policy:   policy,
+		Routes:   routes,
+		Verifier: &auth.Verifier{JWKSURL: *jwksURL, Issuer: *issuer, ClientIDs: policy.Clients()},
 	})
 
 	httpSrv := &http.Server{
-		Addr:    *addr,
-		Handler: srv.Handler(),
-		// Generous, because /v1/inbox holds a request open for up to 60s.
+		Addr:              *addr,
+		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	go server.Poll(ctx, bot, st, allowed)
-
+	go server.Poll(ctx, bot, st, routes)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -170,8 +191,11 @@ func runServe(args []string) error {
 	}()
 
 	offset, pending := st.Stats()
-	log.Printf("bot=@%s listening=%s state=%s offset=%d pending=%d clients=%s group=%q chats=%v",
-		me, *addr, *statePath, offset, pending, *clientIDs, *group, keysOf(allowed))
+	log.Printf("bot=@%s listening=%s offset=%d pending=%d routes=%v clients=%v",
+		me, *addr, offset, pending, routes.Names(), policy.Clients())
+	for _, c := range policy.Clients() {
+		log.Printf("  client %-16s roles=%v", c, policy.Roles(c))
+	}
 
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
@@ -182,7 +206,6 @@ func runServe(args []string) error {
 
 func defaultStatePath() string {
 	if d := os.Getenv("STATE_DIRECTORY"); d != "" {
-		// systemd hands a colon-separated list; the first is ours.
 		return filepath.Join(strings.Split(d, ":")[0], "state.json")
 	}
 	home, _ := os.UserHomeDir()
@@ -200,7 +223,7 @@ func newClient() *client.Client {
 
 func runSay(args []string) error {
 	fs := flag.NewFlagSet("say", flag.ExitOnError)
-	chat := fs.Int64("chat", envInt("HERALD_CHAT", 0), "target chat id")
+	to := fs.String("to", envOr("HERALD_TO", ""), "recipient name (see `herald routes`)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -215,16 +238,16 @@ func runSay(args []string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("nothing to say (give text as arguments or on stdin)")
 	}
-	if *chat == 0 {
-		return fmt.Errorf("no chat: pass --chat or set HERALD_CHAT")
+	if *to == "" {
+		return fmt.Errorf("no recipient: pass --to or set HERALD_TO")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	if err := newClient().Say(ctx, *chat, text); err != nil {
+	if err := newClient().Say(ctx, *to, text); err != nil {
 		return err
 	}
-	fmt.Printf("sent to chat %d\n", *chat)
+	fmt.Printf("sent to %s\n", *to)
 	return nil
 }
 
@@ -242,95 +265,31 @@ func runInbox(args []string) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(msgs)
+	return dump(msgs)
 }
 
-// runPump is the bridge: long-poll the inbox, hand each message to a local
-// figaro aria, send the reply back.
-//
-// This runs on the laptop, which is the whole point of the pull design —
-// spain never reaches into the figaro store, and needs no credential for
-// this machine.
-func runPump(args []string) error {
-	fs := flag.NewFlagSet("pump", flag.ExitOnError)
-	aria := fs.String("aria", envOr("HERALD_ARIA", ""), "figaro aria to route messages into")
-	wait := fs.Duration("wait", 55*time.Second, "long-poll window (server caps at 60s)")
-	once := fs.Bool("once", false, "handle at most one batch, then exit")
-	dryRun := fs.Bool("dry-run", false, "print what would be sent to figaro, do not call it")
+func runAck(args []string) error {
+	fs := flag.NewFlagSet("ack", flag.ExitOnError)
+	through := fs.Int64("through", 0, "drop messages up to and including this id")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	c := newClient()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	log.Printf("pumping %s -> aria %s", c.BaseURL, orNone(*aria))
-	for ctx.Err() == nil {
-		msgs, err := c.Inbox(ctx, 0, *wait)
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			log.Printf("inbox: %v (retrying in 5s)", err)
-			select {
-			case <-ctx.Done():
-			case <-time.After(5 * time.Second):
-			}
-			continue
-		}
-		for _, m := range msgs {
-			if err := handle(ctx, c, m, *aria, *dryRun); err != nil {
-				log.Printf("handling %d: %v", m.ID, err)
-				continue
-			}
-			// Acknowledge only after the reply is out: delivery is
-			// at-least-once, so a crash replays rather than loses.
-			if err := c.Ack(ctx, m.ID); err != nil {
-				log.Printf("ack %d: %v", m.ID, err)
-			}
-		}
-		if *once {
-			break
-		}
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return newClient().Ack(ctx, *through)
 }
 
-func handle(ctx context.Context, c *client.Client, m client.Message, aria string, dryRun bool) error {
-	log.Printf("chat=%d (@%s): %.80q", m.Chat, m.From, m.Text)
-	prompt := "[telegram · via herald] " + m.Text
-
-	if dryRun {
-		fmt.Printf("would send to aria %s: %s\n", orNone(aria), prompt)
-		return nil
-	}
-
-	args := []string{"-A", "send", "-r"}
-	if aria != "" {
-		args = append(args, "--id", aria)
-	}
-	args = append(args, "--", prompt)
-
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+func runRoutes(args []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "figaro", args...).Output()
-	reply := strings.TrimSpace(string(out))
+	names, err := newClient().Routes(ctx)
 	if err != nil {
-		reply = "⚠️ figaro: " + err.Error()
-		if reply == "" {
-			reply = "⚠️ figaro failed with no output"
-		}
+		return err
 	}
-	if reply == "" {
-		reply = "(no output)"
+	for _, n := range names {
+		fmt.Println(n)
 	}
-
-	sendCtx, sendCancel := context.WithTimeout(ctx, 90*time.Second)
-	defer sendCancel()
-	return c.Say(sendCtx, m.Chat, reply)
+	return nil
 }
 
 func runWhoAmI(args []string) error {
@@ -340,9 +299,7 @@ func runWhoAmI(args []string) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(w)
+	return dump(w)
 }
 
 func runHealth(args []string) error {
@@ -352,12 +309,16 @@ func runHealth(args []string) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(h)
+	return dump(h)
 }
 
-// ---------- small helpers ----------
+// ---------- helpers ----------
+
+func dump(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -366,44 +327,9 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int64) int64 {
-	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv(key)), 10, 64); err == nil {
-		return v
-	}
-	return fallback
-}
-
-func splitComma(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func parseChats(s string) map[int64]bool {
-	out := map[int64]bool{}
-	for _, p := range splitComma(s) {
-		if id, err := strconv.ParseInt(p, 10, 64); err == nil {
-			out[id] = true
-		}
-	}
-	return out
-}
-
-func keysOf(m map[int64]bool) []int64 {
-	out := make([]int64, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "(pid-bound)"
+func orEmptyJSON(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "{}"
 	}
 	return s
 }

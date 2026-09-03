@@ -1,11 +1,16 @@
 // Package server is herald's HTTP API and its Telegram poller.
+//
+// Herald is deliberately boring: it is the Telegram Bot API with names
+// instead of chat ids, an inbox that survives restarts, and per-client
+// authorization. It knows nothing about figaro, calendars, or anything else
+// that might want to send a message — those are its callers, and they stay
+// its callers.
 package server
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -13,6 +18,8 @@ import (
 	"time"
 
 	"github.com/jack-work/gluck-herald/internal/auth"
+	"github.com/jack-work/gluck-herald/internal/authz"
+	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/store"
 	"github.com/jack-work/gluck-herald/internal/tg"
 )
@@ -21,32 +28,26 @@ import (
 //
 // Cloudflare terminates a held request at about 100 seconds and returns 524,
 // so /v1/inbox must answer well before that. 60s leaves margin for the
-// tunnel and for a slow client, and the client simply re-polls.
+// tunnel and a slow client, and the client simply re-polls.
 const MaxWait = 60 * time.Second
 
 type Config struct {
-	Addr     string
 	Bot      *tg.Client
 	Store    *store.Store
 	Verifier *auth.Verifier
-
-	// RequiredGroup, when set, gates every authenticated route. Coarse
-	// authorization by lldap group; finer scopes are per-route below.
-	RequiredGroup string
-
-	// AllowedChats restricts which Telegram chats may be addressed. Empty
-	// means any — acceptable only because the bot has a single known peer.
-	AllowedChats map[int64]bool
+	Policy   *authz.Policy
+	Routes   *route.Table
 }
 
 type Server struct {
 	cfg Config
 	mux *http.ServeMux
 
-	// verify is the token check, swappable so tests can exercise routing
-	// and authorization without re-testing the crypto that auth's own
-	// tests cover.
+	// verify and send are swappable so tests can exercise routing and
+	// authorization without re-testing the crypto that auth's own tests
+	// cover, and without a live Telegram.
 	verify func(context.Context, string) (*auth.Identity, error)
+	send   func(context.Context, int64, string) error
 }
 
 func New(cfg Config) *Server {
@@ -54,11 +55,15 @@ func New(cfg Config) *Server {
 	if cfg.Verifier != nil {
 		s.verify = cfg.Verifier.Verify
 	}
+	if cfg.Bot != nil {
+		s.send = cfg.Bot.Send
+	}
 	s.mux.HandleFunc("GET /v1/health", s.health)
-	s.mux.HandleFunc("POST /v1/say", s.authed(s.say))
-	s.mux.HandleFunc("GET /v1/inbox", s.authed(s.inbox))
-	s.mux.HandleFunc("POST /v1/inbox/ack", s.authed(s.ack))
-	s.mux.HandleFunc("GET /v1/whoami", s.authed(s.whoami))
+	s.mux.HandleFunc("GET /v1/whoami", s.need(authz.RoleAdmin, s.whoami))
+	s.mux.HandleFunc("GET /v1/routes", s.need(authz.RoleSay, s.routes))
+	s.mux.HandleFunc("POST /v1/say", s.need(authz.RoleSay, s.say))
+	s.mux.HandleFunc("GET /v1/inbox", s.need(authz.RoleInbox, s.inbox))
+	s.mux.HandleFunc("POST /v1/inbox/ack", s.need(authz.RoleInbox, s.ack))
 	return s
 }
 
@@ -70,12 +75,12 @@ type ctxKey int
 
 const identityKey ctxKey = 0
 
-// authed verifies the bearer token and enforces the coarse group gate.
+// need verifies the bearer token and requires a role.
 //
-// Herald checks the token itself rather than trusting an upstream header:
-// on the bearer path Caddy passes the request through untouched, so nothing
+// Herald checks the token itself rather than trusting an upstream header: on
+// the bearer path Caddy passes the request through untouched, so nothing
 // before this point has validated anything.
-func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) need(role authz.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := s.verify(r.Context(), r.Header.Get("Authorization"))
 		if err != nil {
@@ -86,9 +91,18 @@ func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		if g := s.cfg.RequiredGroup; g != "" && !id.HasGroup(g) {
-			log.Printf("auth: %s lacks group %s", id.Username, g)
-			writeErr(w, http.StatusForbidden, "missing group "+g)
+		// A client herald has never heard of is a 401: the fix is
+		// registration. A known client lacking a role is a 403: the fix is
+		// policy. Different problems, different answers.
+		if !s.cfg.Policy.Known(id.ClientID) {
+			log.Printf("auth: client %q is not in the policy", id.ClientID)
+			writeErr(w, http.StatusUnauthorized, "client not registered with herald")
+			return
+		}
+		if !s.cfg.Policy.Allows(id.ClientID, role) {
+			log.Printf("authz: client %q lacks role %q (has: %v)",
+				id.ClientID, role, s.cfg.Policy.Roles(id.ClientID))
+			writeErr(w, http.StatusForbidden, "client lacks role "+string(role))
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
@@ -107,8 +121,6 @@ func logging(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &recorder{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rec, r)
-		// Every credentialed action is logged. With agents you cannot
-		// prevent misuse, only notice it quickly.
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
 	})
 }
@@ -127,21 +139,24 @@ func (r *recorder) WriteHeader(code int) {
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	offset, pending := s.cfg.Store.Stats()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "offset": offset, "pending": pending,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "offset": offset, "pending": pending})
 }
 
 func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
 	id := identityOf(r)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"subject": id.Subject, "username": id.Username,
-		"groups": id.Groups, "scopes": id.Scopes,
+		"subject": id.Subject, "client_id": id.ClientID,
+		"username": id.Username, "roles": s.cfg.Policy.Roles(id.ClientID),
 	})
 }
 
+func (s *Server) routes(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"routes": s.cfg.Routes.Names()})
+}
+
 type sayRequest struct {
-	Chat int64  `json:"chat"`
+	To   string `json:"to"`   // route name, preferred
+	Chat int64  `json:"chat"` // legacy: a declared chat id
 	Text string `json:"text"`
 }
 
@@ -155,31 +170,29 @@ func (s *Server) say(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "text is empty")
 		return
 	}
-	if req.Chat == 0 {
-		writeErr(w, http.StatusBadRequest, "chat is required")
-		return
+
+	target := req.To
+	if target == "" && req.Chat != 0 {
+		target = strconv.FormatInt(req.Chat, 10)
 	}
-	// The caller names a chat, but only from a fixed set. A gateway whose
-	// caller may name any destination is an open relay that signs its own
-	// requests — the lesson IMDS taught expensively.
-	if len(s.cfg.AllowedChats) > 0 && !s.cfg.AllowedChats[req.Chat] {
-		writeErr(w, http.StatusForbidden, "chat not permitted")
+	chat, err := s.cfg.Routes.Resolve(target)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	if err := s.cfg.Bot.Send(ctx, req.Chat, req.Text); err != nil {
-		log.Printf("say by %s to %d failed: %v", identityOf(r).Username, req.Chat, err)
+	if err := s.send(ctx, chat, req.Text); err != nil {
+		log.Printf("say by %s failed: %v", identityOf(r).ClientID, err)
 		writeErr(w, http.StatusBadGateway, "telegram: "+err.Error())
 		return
 	}
-	log.Printf("say by %s to chat %d (%d bytes)", identityOf(r).Username, req.Chat, len(req.Text))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	log.Printf("say by %s to %s (%d bytes)", identityOf(r).ClientID,
+		s.cfg.Routes.NameFor(chat), len(req.Text))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": s.cfg.Routes.NameFor(chat)})
 }
 
-// inbox long-polls for messages newer than ?after=, returning 204 when the
-// wait elapses with nothing to report.
 func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	limit := 50
@@ -203,7 +216,7 @@ func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register for the wake *before* re-checking, so a message arriving in
+	// Register for the wake BEFORE re-checking, so a message arriving in
 	// between is not missed.
 	woken := s.cfg.Store.Wait()
 	if msgs := s.cfg.Store.Peek(after, limit); len(msgs) > 0 {
@@ -256,7 +269,7 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 // receives 409 Conflict and the two silently split the message stream. That
 // is a configuration error, not a transient one, so it is logged loudly
 // rather than retried quietly.
-func Poll(ctx context.Context, bot *tg.Client, st *store.Store, allowed map[int64]bool) {
+func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Table) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		ups, err := bot.GetUpdates(ctx, st.Offset())
@@ -283,7 +296,7 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, allowed map[int6
 		backoff = time.Second
 
 		var msgs []store.Message
-		var offset = st.Offset()
+		offset := st.Offset()
 		for _, u := range ups {
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
@@ -292,15 +305,15 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, allowed map[int6
 			if m == nil || m.Body() == "" {
 				continue
 			}
-			if len(allowed) > 0 && !allowed[m.Chat.ID] {
-				log.Printf("REFUSED chat=%d user=%d (@%s)", m.Chat.ID, m.From.ID, m.From.Username)
-				_ = bot.Send(ctx, m.Chat.ID, fmt.Sprintf("not authorized.\nchat id: %d", m.Chat.ID))
+			if !routes.Allowed(m.Chat.ID) {
+				log.Printf("REFUSED inbound chat=%d user=%d (@%s)", m.Chat.ID, m.From.ID, m.From.Username)
+				_ = bot.Send(ctx, m.Chat.ID, "not authorized.")
 				continue
 			}
 			msgs = append(msgs, store.Message{
 				ID:       u.UpdateID,
 				Chat:     m.Chat.ID,
-				From:     m.From.Username,
+				From:     routes.NameFor(m.Chat.ID),
 				Text:     m.Body(),
 				Received: time.Unix(m.Date, 0).UTC(),
 			})
@@ -315,7 +328,7 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, allowed map[int6
 			continue
 		}
 		for _, m := range msgs {
-			log.Printf("inbox += chat=%d (@%s) %d bytes", m.Chat, m.From, len(m.Text))
+			log.Printf("inbox += from=%s %d bytes", m.From, len(m.Text))
 		}
 	}
 }

@@ -48,32 +48,47 @@
               '';
             };
 
-            allowedChats = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ ];
-              example = [ "487734915" ];
+            routes = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              example = { gluck = "487734915"; };
               description = ''
-                Telegram chat ids herald will send to and accept from. Empty
-                means any, which makes the gateway an open relay for anyone
-                who finds the bot — set it.
+                Recipient names mapped to Telegram chat ids. Callers name a
+                person — `--to gluck` — so a chat id appears exactly once on
+                the estate, and a caller can only reach declared destinations.
+
+                A gateway whose caller may name any destination is an open
+                relay that signs its own requests, so this is the allowlist in
+                both directions: inbound messages from undeclared chats are
+                refused too. Herald will not start with this empty.
               '';
             };
 
-            clientIds = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ "herald" ];
+            policy = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.listOf (lib.types.enum [ "say" "inbox" "admin" ]));
+              default = { };
+              example = {
+                herald = [ "say" "inbox" "admin" ];
+                kcal-notify = [ "say" ];
+              };
               description = ''
-                OIDC client_id allowlist. This is the gate that stops another
-                service's token from opening herald: Authelia issues access
+                OIDC client_id -> roles. This is both the authentication
+                allowlist and the authorization policy: a client absent here
+                holds nothing.
+
+                Keyed on client_id rather than on a user because a machine
+                caller has no user — a client_credentials token carries no
+                preferred_username and no groups. Authelia also issues access
                 tokens with an empty `aud`, so client_id is what carries the
-                distinction.
-              '';
-            };
+                distinction between one service's token and another's.
 
-            requiredGroup = lib.mkOption {
-              type = lib.types.str;
-              default = "";
-              description = "lldap group required on every authenticated route.";
+                  say    send messages
+                  inbox  read and acknowledge inbound messages
+                  admin  introspection (whoami)
+
+                say and inbox are separate on purpose: a notifier that
+                announces calendar events has no business reading the replies.
+              '';
             };
 
             issuer = lib.mkOption {
@@ -111,9 +126,8 @@
               environment = {
                 HERALD_ISSUER = cfg.issuer;
                 HERALD_JWKS = cfg.jwksUrl;
-                HERALD_CLIENT_IDS = lib.concatStringsSep "," cfg.clientIds;
-                HERALD_GROUP = cfg.requiredGroup;
-                HERALD_CHATS = lib.concatStringsSep "," cfg.allowedChats;
+                HERALD_POLICY = builtins.toJSON cfg.policy;
+                HERALD_ROUTES = builtins.toJSON cfg.routes;
               };
 
               # LoadCredential, not EnvironmentFile and not Environment=:

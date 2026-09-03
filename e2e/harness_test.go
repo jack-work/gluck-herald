@@ -195,7 +195,8 @@ func startHerald(t *testing.T, i *idp, tel *fakeTelegram, extraEnv ...string) *h
 		"--state", state,
 		"--jwks", i.srv.URL,
 		"--issuer", i.issuer,
-		"--client-ids", "herald",
+		"--policy", `{"herald":["say","inbox","admin"],"notifier":["say"]}`,
+		"--routes", `{"gluck":"487734915"}`,
 	)
 	cmd.Env = append(os.Environ(),
 		"HERALD_TELEGRAM_TOKEN=fake-token",

@@ -11,38 +11,50 @@ import (
 	"time"
 
 	"github.com/jack-work/gluck-herald/internal/auth"
+	"github.com/jack-work/gluck-herald/internal/authz"
+	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/store"
 )
 
-// stubVerifier accepts a fixed token, so server tests exercise routing and
-// authorization rather than re-testing crypto (which auth's own tests do).
-type stubVerifier struct{ groups []string }
-
-func (s *stubVerifier) verify(ctx context.Context, header string) (*auth.Identity, error) {
-	if header == "Bearer good" {
-		return &auth.Identity{Subject: "u", Username: "gluck", ClientID: "herald", Groups: s.groups}, nil
-	}
-	if header == "" {
+// stubVerify accepts "Bearer <client_id>", so server tests exercise routing
+// and authorization rather than re-testing the crypto that auth's own tests
+// cover.
+func stubVerify(ctx context.Context, header string) (*auth.Identity, error) {
+	const p = "Bearer "
+	if !strings.HasPrefix(header, p) {
 		return nil, auth.ErrNoToken
 	}
-	return nil, errBad
+	id := strings.TrimSpace(header[len(p):])
+	if id == "" || id == "bad" {
+		return nil, errBadToken
+	}
+	return &auth.Identity{Subject: "s-" + id, ClientID: id, Username: ""}, nil
 }
 
-var errBad = &stubErr{}
+type badToken struct{}
 
-type stubErr struct{}
+func (badToken) Error() string { return "bad token" }
 
-func (*stubErr) Error() string { return "bad token" }
+var errBadToken = badToken{}
 
-func newTestServer(t *testing.T, groups []string, requiredGroup string) (*httptest.Server, *store.Store) {
+func newTestServer(t *testing.T, policy map[string][]string) (*httptest.Server, *store.Store) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sv := &stubVerifier{groups: groups}
-	s := New(Config{Store: st, RequiredGroup: requiredGroup})
-	s.verify = sv.verify
+	pol, err := authz.NewPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := route.NewTable(map[string]string{"gluck": "487734915"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(Config{Store: st, Policy: pol, Routes: routes})
+	s.verify = stubVerify
+	s.send = func(context.Context, int64, string) error { return nil }
 
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
@@ -62,7 +74,7 @@ func req(t *testing.T, srv *httptest.Server, method, path, token, body string) *
 		t.Fatal(err)
 	}
 	if token != "" {
-		r.Header.Set("Authorization", token)
+		r.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := srv.Client().Do(r)
 	if err != nil {
@@ -72,8 +84,8 @@ func req(t *testing.T, srv *httptest.Server, method, path, token, body string) *
 }
 
 func TestUnauthenticatedRequestsAreRefused(t *testing.T) {
-	srv, _ := newTestServer(t, nil, "")
-	for _, path := range []string{"/v1/inbox", "/v1/whoami"} {
+	srv, _ := newTestServer(t, map[string][]string{"herald": {"say", "inbox", "admin"}})
+	for _, path := range []string{"/v1/inbox", "/v1/whoami", "/v1/routes"} {
 		resp := req(t, srv, http.MethodGet, path, "", "")
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -83,15 +95,10 @@ func TestUnauthenticatedRequestsAreRefused(t *testing.T) {
 			t.Errorf("GET %s should advertise the bearer scheme", path)
 		}
 	}
-	resp := req(t, srv, http.MethodPost, "/v1/say", "Bearer nonsense", `{"chat":1,"text":"x"}`)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("bad token = %d, want 401", resp.StatusCode)
-	}
 }
 
 func TestHealthNeedsNoAuth(t *testing.T) {
-	srv, _ := newTestServer(t, nil, "")
+	srv, _ := newTestServer(t, nil)
 	resp := req(t, srv, http.MethodGet, "/v1/health", "", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -99,46 +106,95 @@ func TestHealthNeedsNoAuth(t *testing.T) {
 	}
 }
 
-func TestGroupGate(t *testing.T) {
-	srv, _ := newTestServer(t, []string{"other"}, "herald-admin")
-	resp := req(t, srv, http.MethodGet, "/v1/whoami", "Bearer good", "")
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("missing group = %d, want 403", resp.StatusCode)
-	}
+// The role model's whole point: a notifier that announces events must not be
+// able to read the replies to them.
+func TestRolesAreEnforcedPerEndpoint(t *testing.T) {
+	srv, _ := newTestServer(t, map[string][]string{
+		"kcal-notify": {"say"},                   // may send, may not read
+		"figaro":      {"say", "inbox"},          // the bridge: both
+		"admin-cli":   {"say", "inbox", "admin"}, // everything
+	})
 
-	srv2, _ := newTestServer(t, []string{"herald-admin"}, "herald-admin")
-	resp2 := req(t, srv2, http.MethodGet, "/v1/whoami", "Bearer good", "")
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("with group = %d, want 200", resp2.StatusCode)
+	cases := []struct {
+		client, method, path, body string
+		want                       int
+	}{
+		{"kcal-notify", http.MethodPost, "/v1/say", `{"to":"gluck","text":"hi"}`, http.StatusOK},
+		{"kcal-notify", http.MethodGet, "/v1/inbox?wait=0", "", http.StatusForbidden},
+		{"kcal-notify", http.MethodPost, "/v1/inbox/ack", `{"through":1}`, http.StatusForbidden},
+		{"kcal-notify", http.MethodGet, "/v1/whoami", "", http.StatusForbidden},
+		{"figaro", http.MethodGet, "/v1/inbox?wait=0", "", http.StatusNoContent},
+		{"figaro", http.MethodGet, "/v1/whoami", "", http.StatusForbidden},
+		{"admin-cli", http.MethodGet, "/v1/whoami", "", http.StatusOK},
+		{"admin-cli", http.MethodGet, "/v1/inbox?wait=0", "", http.StatusNoContent},
+	}
+	for _, c := range cases {
+		resp := req(t, srv, c.method, c.path, c.client, c.body)
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("%s %s as %q = %d, want %d", c.method, c.path, c.client, resp.StatusCode, c.want)
+		}
 	}
 }
 
-// The caller may name a chat, but only from a fixed set: a gateway whose
-// caller can name any destination is an open relay that signs its requests.
-func TestSayRefusesChatsOutsideTheAllowlist(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "s.json"))
-	if err != nil {
+// A client herald has never heard of is a 401 (fix: register it); a known
+// client lacking a role is a 403 (fix: policy). Different problems.
+func TestUnknownClientIs401AndUnprivilegedIs403(t *testing.T) {
+	srv, _ := newTestServer(t, map[string][]string{"known": {"say"}})
+
+	resp := req(t, srv, http.MethodGet, "/v1/routes", "stranger", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("unregistered client = %d, want 401", resp.StatusCode)
+	}
+
+	resp2 := req(t, srv, http.MethodGet, "/v1/inbox?wait=0", "known", "")
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("known client without the role = %d, want 403", resp2.StatusCode)
+	}
+}
+
+// The caller names a recipient; the server resolves it. An undeclared
+// destination is refused however it is spelled — a gateway whose caller may
+// name any destination is an open relay that signs its own requests.
+func TestSayRefusesUndeclaredRecipients(t *testing.T) {
+	srv, _ := newTestServer(t, map[string][]string{"c": {"say"}})
+
+	for _, body := range []string{
+		`{"to":"stranger","text":"hi"}`,
+		`{"chat":999,"text":"hi"}`,
+		`{"to":"999","text":"hi"}`,
+		`{"text":"hi"}`,
+	} {
+		resp := req(t, srv, http.MethodPost, "/v1/say", "c", body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("say %s = %d, want 400", body, resp.StatusCode)
+		}
+	}
+}
+
+func TestRoutesListsNames(t *testing.T) {
+	srv, _ := newTestServer(t, map[string][]string{"c": {"say"}})
+	resp := req(t, srv, http.MethodGet, "/v1/routes", "c", "")
+	defer resp.Body.Close()
+
+	var out struct {
+		Routes []string `json:"routes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	sv := &stubVerifier{}
-	s := New(Config{Store: st, AllowedChats: map[int64]bool{111: true}})
-	s.verify = sv.verify
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
-
-	resp := req(t, srv, http.MethodPost, "/v1/say", "Bearer good", `{"chat":999,"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("unlisted chat = %d, want 403", resp.StatusCode)
+	if len(out.Routes) != 1 || out.Routes[0] != "gluck" {
+		t.Errorf("routes = %v", out.Routes)
 	}
 }
 
 func TestInboxLongPollReturns204WhenIdle(t *testing.T) {
-	srv, _ := newTestServer(t, nil, "")
+	srv, _ := newTestServer(t, map[string][]string{"c": {"inbox"}})
 	start := time.Now()
-	resp := req(t, srv, http.MethodGet, "/v1/inbox?wait=300ms", "Bearer good", "")
+	resp := req(t, srv, http.MethodGet, "/v1/inbox?wait=300ms", "c", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("idle poll = %d, want 204", resp.StatusCode)
@@ -148,18 +204,17 @@ func TestInboxLongPollReturns204WhenIdle(t *testing.T) {
 	}
 }
 
-// A message arriving mid-poll must wake the waiter, not wait for the
-// timeout: that is the difference between a gateway and a polling loop.
+// A message arriving mid-poll must wake the waiter, not wait for the timeout.
 func TestInboxLongPollWakesOnArrival(t *testing.T) {
-	srv, st := newTestServer(t, nil, "")
+	srv, st := newTestServer(t, map[string][]string{"c": {"inbox"}})
 
 	go func() {
 		time.Sleep(150 * time.Millisecond)
-		_ = st.Append(43, []store.Message{{ID: 42, Chat: 7, Text: "ping"}})
+		_ = st.Append(43, []store.Message{{ID: 42, Chat: 487734915, Text: "ping"}})
 	}()
 
 	start := time.Now()
-	resp := req(t, srv, http.MethodGet, "/v1/inbox?wait=10s", "Bearer good", "")
+	resp := req(t, srv, http.MethodGet, "/v1/inbox?wait=10s", "c", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("poll = %d, want 200", resp.StatusCode)
@@ -176,8 +231,7 @@ func TestInboxLongPollWakesOnArrival(t *testing.T) {
 	}
 }
 
-// Cloudflare kills a held request at ~100s, so the server must cap the wait
-// well under that no matter what the client asks for.
+// Cloudflare kills a held request at ~100s, so the cap must sit well under.
 func TestInboxWaitIsCappedBelowCloudflaresLimit(t *testing.T) {
 	if MaxWait >= 100*time.Second {
 		t.Fatalf("MaxWait = %s; Cloudflare returns 524 at about 100s", MaxWait)
@@ -185,11 +239,11 @@ func TestInboxWaitIsCappedBelowCloudflaresLimit(t *testing.T) {
 }
 
 func TestAckDropsDeliveredMessages(t *testing.T) {
-	srv, st := newTestServer(t, nil, "")
+	srv, st := newTestServer(t, map[string][]string{"c": {"inbox"}})
 	if err := st.Append(3, []store.Message{{ID: 1, Text: "a"}, {ID: 2, Text: "b"}}); err != nil {
 		t.Fatal(err)
 	}
-	resp := req(t, srv, http.MethodPost, "/v1/inbox/ack", "Bearer good", `{"through":1}`)
+	resp := req(t, srv, http.MethodPost, "/v1/inbox/ack", "c", `{"through":1}`)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("ack = %d", resp.StatusCode)

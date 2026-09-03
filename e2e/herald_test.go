@@ -36,12 +36,14 @@ func TestInboundMessageReachesCLIAndReplyReachesTelegram(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("got %d messages, want 1: %s", len(msgs), out)
 	}
-	if msgs[0].Text != "hello from the phone" || msgs[0].From != "underiraq" {
+	// From is the ROUTE NAME, not the telegram username: callers deal in
+	// names herald declared, never in Telegram's own identifiers.
+	if msgs[0].Text != "hello from the phone" || msgs[0].From != "gluck" {
 		t.Errorf("message = %+v", msgs[0])
 	}
 
 	// Reply through the CLI.
-	if out, err := h.cli(t, token, "say", "--chat", "487734915", "**bold** reply"); err != nil {
+	if out, err := h.cli(t, token, "say", "--to", "gluck", "**bold** reply"); err != nil {
 		t.Fatalf("say: %v\n%s", err, out)
 	}
 
@@ -152,35 +154,54 @@ func TestAckStopsRedelivery(t *testing.T) {
 		t.Errorf("message vanished before it was acknowledged: %q", again)
 	}
 
-	// The pump acks through the id it handled; do the same by hand.
-	if out, err := h.cli(t, token, "say", "--chat", "487734915", "ack test"); err != nil {
-		t.Fatalf("say: %v\n%s", err, out)
+	// Acknowledge, then confirm it is gone.
+	if out, err := h.cli(t, token, "ack", "--through", "999999"); err != nil {
+		t.Fatalf("ack: %v\n%s", err, out)
+	}
+	cleared, err := h.cli(t, token, "inbox", "--wait", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cleared, "\"id\"") {
+		t.Errorf("messages survived an ack: %q", cleared)
 	}
 }
 
-// dry-run pump proves the routing path without invoking figaro.
-func TestPumpDryRunRoutesMessage(t *testing.T) {
+// A client holding only "say" must not be able to read the inbox — the
+// property that lets a notifier announce events without seeing the replies.
+func TestRoleSeparationOverTheWire(t *testing.T) {
 	idp := newIDP(t)
 	tel := newTelegram(t)
 	h := startHerald(t, idp, tel)
-	token := idp.mint(t, "herald", []string{"admins"})
+	notifier := idp.mint(t, "notifier", nil)
 
-	tel.deliver(487734915, "underiraq", "route me")
+	if out, err := h.cli(t, notifier, "say", "--to", "gluck", "from the notifier"); err != nil {
+		t.Fatalf("notifier should be allowed to say: %v\n%s", err, out)
+	}
+	if out, err := h.cli(t, notifier, "inbox", "--wait", "0"); err == nil {
+		t.Errorf("notifier must not read the inbox:\n%s", out)
+	}
+	if out, err := h.cli(t, notifier, "whoami"); err == nil {
+		t.Errorf("notifier must not have admin:\n%s", out)
+	}
+}
 
-	out, err := h.cli(t, token, "pump", "--once", "--dry-run", "--aria", "abc123", "--wait", "10s")
-	if err != nil {
-		t.Fatalf("pump: %v\n%s\nserver:\n%s", err, out, h.logs())
+// Recipients are named; an undeclared destination is refused however it is
+// spelled.
+func TestUndeclaredRecipientIsRefusedEndToEnd(t *testing.T) {
+	idp := newIDP(t)
+	tel := newTelegram(t)
+	h := startHerald(t, idp, tel)
+	token := idp.mint(t, "herald", nil)
+
+	if out, err := h.cli(t, token, "say", "--to", "stranger", "hi"); err == nil {
+		t.Errorf("undeclared name accepted:\n%s", out)
 	}
-	if !strings.Contains(out, "route me") {
-		t.Errorf("pump did not surface the message: %q", out)
+	if out, err := h.cli(t, token, "say", "--to", "999999", "hi"); err == nil {
+		t.Errorf("undeclared chat id accepted:\n%s", out)
 	}
-	if !strings.Contains(out, "abc123") {
-		t.Errorf("pump did not target the requested aria: %q", out)
-	}
-	// The prompt must be marked, so an aria with a terminal open can tell
-	// which door a message came through.
-	if !strings.Contains(out, "telegram") {
-		t.Errorf("routed prompt is not marked as telegram: %q", out)
+	if n := len(tel.messages()); n != 0 {
+		t.Errorf("telegram received %d messages from refused calls", n)
 	}
 }
 
