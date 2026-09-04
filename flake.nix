@@ -17,7 +17,9 @@
         pname = "herald";
         version = "0.1.0";
         src = ./.;
-        vendorHash = null; # stdlib only — no dependencies to vendor
+        # herald depends on gluck-authz, so a vendor hash is required. Bump it
+        # whenever go.sum changes: nix prints the correct value on mismatch.
+        vendorHash = "sha256-diNWgzWpJSReRWo0vD3RzAG1F8nCYESwEAy8rvSReqg=";
         # The module name is gluck-herald but the binary is `herald`, so name it
         # explicitly: buildGoModule would otherwise derive it from the module
         # path and lib.getExe would point at a file that does not exist.
