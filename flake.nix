@@ -121,7 +121,11 @@
               # `Authorization: Bearer` is passed through untouched — which
               # is exactly why herald verifies the JWT itself.
               requireAuth = true;
-              requiredGroups = lib.optional (cfg.requiredGroup != "") cfg.requiredGroup;
+              # No lldap group is required at the proxy. Herald authorizes on
+              # client_id and roles, which is the only model that works for a
+              # machine caller — a client_credentials token carries no groups
+              # at all. Authelia still gates the browser path.
+              requiredGroups = [ ];
 
               environment = {
                 HERALD_ISSUER = cfg.issuer;
