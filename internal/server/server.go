@@ -3,7 +3,7 @@
 // Herald is deliberately boring: it is the Telegram Bot API with names
 // instead of chat ids, an inbox that survives restarts, and per-client
 // authorization. It knows nothing about figaro, calendars, or anything else
-// that might want to send a message — those are its callers, and they stay
+// that might want to send a message: those are its callers, and they stay
 // its callers.
 package server
 
@@ -278,7 +278,7 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Ta
 				return
 			}
 			if tg.IsConflict(err) {
-				log.Printf("CONFLICT: another process is polling this bot — "+
+				log.Printf("CONFLICT: another process is polling this bot, "+
 					"messages are being split between us. Stop the other one. (%v)", err)
 			} else {
 				log.Printf("getUpdates: %v (retry in %s)", err, backoff)
@@ -323,7 +323,7 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Ta
 		}
 		// Persist offset and messages together, before anyone is told.
 		if err := st.Append(offset, msgs); err != nil {
-			log.Printf("persist: %v — not advancing offset", err)
+			log.Printf("persist: %v: not advancing offset", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}

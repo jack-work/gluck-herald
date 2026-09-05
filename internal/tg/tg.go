@@ -1,5 +1,5 @@
 // Package tg is a minimal Telegram Bot API client: long polling in,
-// markdown-rendered messages out. Stdlib only — the Bot API is two calls and
+// markdown-rendered messages out. Stdlib only: the Bot API is two calls and
 // long polling is a query parameter, so a framework would be all cost.
 package tg
 
@@ -63,7 +63,7 @@ type apiResponse struct {
 }
 
 // Error is a Telegram-side rejection, carrying the code so callers can
-// distinguish the ones that matter — notably 409 Conflict, which means a
+// distinguish the ones that matter: notably 409 Conflict, which means a
 // second getUpdates consumer is running and updates are being split.
 type Error struct {
 	Method string
@@ -194,7 +194,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 // HTML is the pragmatic parse_mode: only & < > need escaping, where
 // MarkdownV2 demands 18 characters and drops the entire message on a single
 // miss. If Telegram still rejects the markup, the chunk is resent as plain
-// text — a formatting mistake must never eat a message.
+// text: a formatting mistake must never eat a message.
 func (c *Client) Send(ctx context.Context, chat int64, markdown string) error {
 	for _, part := range Chunk(markdown, MaxMsgRunes) {
 		html := md.ToHTML(part)

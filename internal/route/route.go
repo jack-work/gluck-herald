@@ -1,7 +1,7 @@
 // Package route resolves recipient names to Telegram chat ids.
 //
 // This is herald's one piece of vocabulary on top of the Telegram API.
-// Callers name a person — "gluck" — rather than carrying 487734915 around in
+// Callers name a person, "gluck", rather than carrying 487734915 around in
 // their configuration, argv and logs. Names are declared centrally, so a chat
 // id appears exactly once on the whole estate.
 //
@@ -65,7 +65,7 @@ func (t *Table) Resolve(name string) (int64, error) {
 	return 0, fmt.Errorf("unknown recipient %q (known: %s)", name, strings.Join(t.Names(), ", "))
 }
 
-// NameFor returns the route name for a chat id, or "" — used to label
+// NameFor returns the route name for a chat id, or "", used to label
 // inbound messages with something a human recognises.
 func (t *Table) NameFor(chat int64) string {
 	for n, id := range t.byName {

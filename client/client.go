@@ -2,7 +2,7 @@
 //
 // This is the public surface other programs build on: the figaro bridge, the
 // calendar notifier, anything that wants to send you a message. Herald itself
-// knows nothing about them, which is the point — it is the Telegram API with
+// knows nothing about them, which is the point: it is the Telegram API with
 // names and an inbox, and everything domain-specific is a caller.
 //
 // Credentials arrive through a TokenSource. The bundled EnvTokenSource reads
@@ -109,7 +109,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 		}
 		if retryOnUnauthorized {
 			resp.Body.Close()
-			// A token can be valid by the clock and still rejected — revoked,
+			// A token can be valid by the clock and still rejected: revoked,
 			// or signed by a rotated key. Only the 401 knows this; expiry
 			// math does not.
 			fresh, rerr := c.Tokens.Refresh(ctx)
@@ -149,7 +149,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 // Say sends a markdown message to a named recipient.
 //
 // The name is resolved by the server against its declared routes, so a
-// caller never carries a chat id — and cannot reach a chat the deployment
+// caller never carries a chat id: and cannot reach a chat the deployment
 // has not declared.
 func (c *Client) Say(ctx context.Context, to, text string) error {
 	return c.do(ctx, http.MethodPost, "/v1/say",

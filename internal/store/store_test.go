@@ -102,7 +102,7 @@ func TestInboxIsBoundedDroppingOldestFirst(t *testing.T) {
 		t.Fatalf("retained %d messages, want 3", len(got))
 	}
 	if got[0].ID != 4 || got[2].ID != 6 {
-		t.Errorf("wrong messages retained: %+v — oldest should be dropped", got)
+		t.Errorf("wrong messages retained: %+v: oldest should be dropped", got)
 	}
 }
 
@@ -136,7 +136,7 @@ func TestEmptyAppendDoesNotWake(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	if off := s.Offset(); off != 7 {
-		t.Errorf("offset = %d, want 7 — an empty batch still advances it", off)
+		t.Errorf("offset = %d, want 7: an empty batch still advances it", off)
 	}
 }
 

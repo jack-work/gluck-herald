@@ -4,7 +4,7 @@
 // issuing real RS256 tokens, a fake Telegram API, the actual server process,
 // and the actual CLI talking to it over HTTP.
 //
-// Nothing here stubs herald's own code — the binary under test is the one
+// Nothing here stubs herald's own code: the binary under test is the one
 // that ships.
 package e2e
 

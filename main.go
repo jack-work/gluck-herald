@@ -32,7 +32,7 @@ import (
 	"github.com/jack-work/gluck-herald/internal/tg"
 )
 
-const usage = `herald — message gateway (telegram, with names)
+const usage = `herald: message gateway (telegram, with names)
 
 Server:
   herald serve                        run the API and the telegram poller
@@ -95,7 +95,7 @@ func main() {
 //
 // LoadCredential is the delivery of record: the value lands in a per-unit
 // tmpfs at 0400 and vanishes with the unit. Never Environment= in a unit
-// file — those are world-readable in /nix/store forever, and in git history.
+// file: those are world-readable in /nix/store forever, and in git history.
 func telegramToken() (string, error) {
 	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
 		b, err := os.ReadFile(filepath.Join(dir, "token"))

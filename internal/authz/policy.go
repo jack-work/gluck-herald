@@ -1,8 +1,8 @@
 // Package authz decides what a verified caller may do.
 //
 // Herald deliberately keys authorization on the OIDC client_id rather than on
-// a user. A machine caller — a timer on spain minting a client_credentials
-// token — has no user at all: no preferred_username, no groups. Any model
+// a user. A machine caller: a timer on spain minting a client_credentials
+// token: has no user at all: no preferred_username, no groups. Any model
 // built on "which person is this" cannot express it, so herald asks "which
 // program is this, and what is it allowed to do".
 package authz
@@ -81,7 +81,7 @@ func (p *Policy) Allows(clientID string, role Role) bool {
 
 // Known reports whether the client appears in the policy at all. Used to
 // distinguish "not registered here" (401) from "registered but not permitted
-// this" (403) — a distinction worth keeping, because they call for different
+// this" (403), a distinction worth keeping, because they call for different
 // fixes.
 func (p *Policy) Known(clientID string) bool {
 	if p == nil {

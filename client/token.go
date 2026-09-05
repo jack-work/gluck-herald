@@ -17,7 +17,7 @@ import (
 //	herald = "HERALD_TOKEN"
 //
 // and hush places the current access token in the child's environment. The
-// CLI never learns where the credential came from, which is the point — the
+// CLI never learns where the credential came from, which is the point: the
 // same binary works under a shim, under systemd with LoadCredential, or with
 // a token pasted in by hand.
 type EnvTokenSource struct {
@@ -41,7 +41,7 @@ func (e *EnvTokenSource) Token(context.Context) (string, error) {
 	tok := strings.TrimSpace(os.Getenv(e.name()))
 	if tok == "" {
 		return "", errors.New("no token in $" + e.name() +
-			" — run through hush (`hush herald …`) or set it explicitly")
+			", run through hush (`hush herald …`) or set it explicitly")
 	}
 	return tok, nil
 }

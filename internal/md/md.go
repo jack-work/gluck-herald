@@ -85,7 +85,7 @@ func ToHTML(md string) string {
 	return strings.TrimSpace(s)
 }
 
-// StripTags renders HTML back to plain text — the fallback when Telegram
+// StripTags renders HTML back to plain text: the fallback when Telegram
 // rejects our markup, so a message is never lost to a parse error.
 func StripTags(s string) string {
 	var b strings.Builder

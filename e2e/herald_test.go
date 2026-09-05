@@ -119,7 +119,7 @@ func TestLongPollWakesOnArrivalAndTimesOutCleanly(t *testing.T) {
 		t.Fatalf("idle poll errored: %v\n%s", err, out)
 	}
 	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
-		t.Errorf("idle poll returned after %s — it did not wait", elapsed)
+		t.Errorf("idle poll returned after %s: it did not wait", elapsed)
 	}
 	if strings.TrimSpace(out) != "null" && strings.TrimSpace(out) != "[]" {
 		t.Errorf("idle poll should yield no messages, got %q", out)
@@ -167,7 +167,7 @@ func TestAckStopsRedelivery(t *testing.T) {
 	}
 }
 
-// A client holding only "say" must not be able to read the inbox — the
+// A client holding only "say" must not be able to read the inbox: the
 // property that lets a notifier announce events without seeing the replies.
 func TestRoleSeparationOverTheWire(t *testing.T) {
 	idp := newIDP(t)

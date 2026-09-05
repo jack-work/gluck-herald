@@ -23,7 +23,7 @@ import (
 // authorizes on its client_id.
 //
 // The distinction that matters: the long-lived secret never leaves the box
-// and never reaches herald. Herald and the caller share nothing — herald
+// and never reaches herald. Herald and the caller share nothing: herald
 // checks a signature made by Authelia. Compare a permanent bearer token,
 // where both ends hold the same bytes and either can leak it.
 type ClientCredentials struct {
@@ -33,7 +33,7 @@ type ClientCredentials struct {
 	ClientID string
 	// ClientSecret is the machine's own credential. Prefer SecretFile.
 	ClientSecret string
-	// SecretFile reads the secret from disk at first use — normally
+	// SecretFile reads the secret from disk at first use: normally
 	// $CREDENTIALS_DIRECTORY/<name>, so the value never appears in a unit
 	// file (world-readable in /nix/store, forever) or in argv
 	// (world-readable in /proc).
@@ -102,8 +102,8 @@ func (c *ClientCredentials) Token(ctx context.Context) (string, error) {
 }
 
 // Refresh discards the cached token and mints a new one. Called after a 401:
-// a token can be valid by the clock and still rejected — revoked, or signed
-// by a rotated key — and only the 401 knows.
+// a token can be valid by the clock and still rejected: revoked, or signed
+// by a rotated key: and only the 401 knows.
 func (c *ClientCredentials) Refresh(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -131,7 +131,7 @@ func (c *ClientCredentials) mintLocked(ctx context.Context) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	// client_secret_basic: the secret goes in the Authorization header, not
-	// in the body and never in a URL — URLs end up in logs and referrers.
+	// in the body and never in a URL: URLs end up in logs and referrers.
 	req.SetBasicAuth(url.QueryEscape(c.ClientID), url.QueryEscape(secret))
 
 	resp, err := c.client().Do(req)

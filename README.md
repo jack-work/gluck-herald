@@ -5,7 +5,7 @@ a durable inbox, and per-client authorization.
 
 Herald is deliberately boring and deliberately ignorant. It knows nothing
 about figaro, calendars, or anything else that might want to send you a
-message — those are *callers*, and they live in their own modules and depend
+message: those are *callers*, and they live in their own modules and depend
 on `client`.
 
 ```
@@ -26,7 +26,7 @@ Telegram ──poll──▶ herald ──▶ Caddy ──▶ Cloudflare
 
 | route | role | purpose |
 |---|---|---|
-| `GET /v1/health` | — | liveness, offset, queue depth |
+| `GET /v1/health` |, | liveness, offset, queue depth |
 | `GET /v1/whoami` | `admin` | what your token asserts |
 | `GET /v1/routes` | `say` | recipient names you may address |
 | `POST /v1/say` | `say` | send markdown to a named recipient |
@@ -40,7 +40,7 @@ Long polls cap at 60s: Cloudflare kills a held request at ~100s with a 524.
 Herald verifies tokens itself. On the bearer path Caddy passes requests
 through untouched, so nothing upstream has checked anything.
 
-- **Signature** against Authelia's JWKS, RS256/RS512 only — the token does not
+- **Signature** against Authelia's JWKS, RS256/RS512 only: the token does not
   get to choose how it is checked, so `alg: none` cannot apply.
 - **`client_id`**, not audience. Authelia issues access tokens with an empty
   `aud` (verified against a live token, not assumed); an `aud` check would be
@@ -93,7 +93,7 @@ only a short-lived token Authelia signed.
 ## Deploying
 
 One `mkService` call; see `flake.nix`. The bot token arrives by
-`LoadCredential` from sops — never `Environment=` (unit files are
+`LoadCredential` from sops: never `Environment=` (unit files are
 world-readable in `/nix/store` forever, and in git history) and never argv
 (`/proc/<pid>/cmdline` is world-readable). DynamicUser stays on: herald writes
 only its own `StateDirectory`.

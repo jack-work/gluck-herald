@@ -34,7 +34,7 @@ func TestPolicyGrantsOnlyWhatIsDeclared(t *testing.T) {
 	}
 }
 
-// A typo in configuration must fail at startup, not silently grant nothing —
+// A typo in configuration must fail at startup, not silently grant nothing,
 // or, worse, be mistaken for a grant.
 func TestUnknownRoleIsRejectedAtLoad(t *testing.T) {
 	_, err := NewPolicy(map[string][]string{"svc": {"say", "delete-everything"}})

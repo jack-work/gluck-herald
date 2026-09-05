@@ -1,5 +1,5 @@
 {
-  description = "gluck-herald — authenticated message gateway (telegram ⇄ figaro) behind kelliher-web";
+  description = "gluck-herald: authenticated message gateway (telegram ⇄ figaro) behind kelliher-web";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -56,7 +56,7 @@
               example = { gluck = "487734915"; };
               description = ''
                 Recipient names mapped to Telegram chat ids. Callers name a
-                person — `--to gluck` — so a chat id appears exactly once on
+                person, `--to gluck`, so a chat id appears exactly once on
                 the estate, and a caller can only reach declared destinations.
 
                 A gateway whose caller may name any destination is an open
@@ -79,7 +79,7 @@
                 holds nothing.
 
                 Keyed on client_id rather than on a user because a machine
-                caller has no user — a client_credentials token carries no
+                caller has no user: a client_credentials token carries no
                 preferred_username and no groups. Authelia also issues access
                 tokens with an empty `aud`, so client_id is what carries the
                 distinction between one service's token and another's.
@@ -120,12 +120,12 @@
 
               # requireAuth gives both paths at once: browsers are
               # forward-authed to Authelia, while a request carrying
-              # `Authorization: Bearer` is passed through untouched — which
+              # `Authorization: Bearer` is passed through untouched: which
               # is exactly why herald verifies the JWT itself.
               requireAuth = true;
               # No lldap group is required at the proxy. Herald authorizes on
               # client_id and roles, which is the only model that works for a
-              # machine caller — a client_credentials token carries no groups
+              # machine caller: a client_credentials token carries no groups
               # at all. Authelia still gates the browser path.
               requiredGroups = [ ];
 

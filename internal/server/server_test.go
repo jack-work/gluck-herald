@@ -156,7 +156,7 @@ func TestUnknownClientIs401AndUnprivilegedIs403(t *testing.T) {
 }
 
 // The caller names a recipient; the server resolves it. An undeclared
-// destination is refused however it is spelled — a gateway whose caller may
+// destination is refused however it is spelled: a gateway whose caller may
 // name any destination is an open relay that signs its own requests.
 func TestSayRefusesUndeclaredRecipients(t *testing.T) {
 	srv, _ := newTestServer(t, map[string][]string{"c": {"say"}})
@@ -200,7 +200,7 @@ func TestInboxLongPollReturns204WhenIdle(t *testing.T) {
 		t.Fatalf("idle poll = %d, want 204", resp.StatusCode)
 	}
 	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
-		t.Errorf("returned after %s — it did not actually wait", elapsed)
+		t.Errorf("returned after %s: it did not actually wait", elapsed)
 	}
 }
 
@@ -220,7 +220,7 @@ func TestInboxLongPollWakesOnArrival(t *testing.T) {
 		t.Fatalf("poll = %d, want 200", resp.StatusCode)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("woke after %s — it slept through the arrival", elapsed)
+		t.Errorf("woke after %s: it slept through the arrival", elapsed)
 	}
 	var out struct{ Messages []store.Message }
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
