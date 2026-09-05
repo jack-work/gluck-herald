@@ -156,6 +156,15 @@ func (c *Client) Say(ctx context.Context, to, text string) error {
 		map[string]any{"to": to, "text": text}, nil, true)
 }
 
+// Typing shows the recipient a "typing..." indicator.
+//
+// Telegram clears it after a few seconds, so call this repeatedly for as long
+// as the work lasts. No retry on 401: a missed indicator is not worth a
+// second round trip, and the next call will carry a fresh token.
+func (c *Client) Typing(ctx context.Context, to string) error {
+	return c.do(ctx, http.MethodPost, "/v1/typing", map[string]any{"to": to}, nil, false)
+}
+
 // Routes lists the recipient names this server will accept.
 func (c *Client) Routes(ctx context.Context) ([]string, error) {
 	var out struct {

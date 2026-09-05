@@ -224,6 +224,8 @@ func newClient() *client.Client {
 func runSay(args []string) error {
 	fs := flag.NewFlagSet("say", flag.ExitOnError)
 	to := fs.String("to", envOr("HERALD_TO", ""), "recipient name (see `herald routes`)")
+	noFooter := fs.Bool("no-footer", false, "omit the sender footer")
+	from := fs.String("from", envOr("HERALD_FROM", ""), "label for the footer, normally the sender's mantra")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -240,6 +242,9 @@ func runSay(args []string) error {
 	}
 	if *to == "" {
 		return fmt.Errorf("no recipient: pass --to or set HERALD_TO")
+	}
+	if !*noFooter {
+		text += senderFooter(*from)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -318,6 +323,33 @@ func dump(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// senderFooter identifies who sent a message.
+//
+// Several arias share one chat, so a reply with no attribution leaves the
+// reader guessing which of them answered. FIGARO_ARIA is set by the daemon
+// inside an aria's bash tool, so the id costs nothing and needs no plumbing.
+//
+// The label is passed in rather than looked up: an aria knows its own mantra,
+// and asking herald to fetch it would make a message gateway depend on
+// figaro, which is the coupling herald exists to avoid.
+//
+// Attribution, not authentication. Anything can set these. That is fine for a
+// label and would not be for a permission.
+func senderFooter(label string) string {
+	aria := strings.TrimSpace(os.Getenv("FIGARO_ARIA"))
+	label = strings.TrimSpace(label)
+	switch {
+	case aria == "" && label == "":
+		return ""
+	case aria == "":
+		return "\n\n_" + label + "_"
+	case label == "":
+		return "\n\n`" + aria + "`"
+	default:
+		return "\n\n`" + aria + "` _" + label + "_"
+	}
 }
 
 func envOr(key, fallback string) string {

@@ -46,8 +46,9 @@ type Server struct {
 	// verify and send are swappable so tests can exercise routing and
 	// authorization without re-testing the crypto that auth's own tests
 	// cover, and without a live Telegram.
-	verify func(context.Context, string) (*gauthz.Identity, error)
-	send   func(context.Context, int64, string) error
+	verify   func(context.Context, string) (*gauthz.Identity, error)
+	send     func(context.Context, int64, string) error
+	typingFn func(context.Context, int64) error
 }
 
 func New(cfg Config) *Server {
@@ -57,11 +58,14 @@ func New(cfg Config) *Server {
 	}
 	if cfg.Bot != nil {
 		s.send = cfg.Bot.Send
+		s.typingFn = cfg.Bot.Typing
+		s.typingFn = cfg.Bot.Typing
 	}
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.HandleFunc("GET /v1/whoami", s.need(authz.RoleAdmin, s.whoami))
 	s.mux.HandleFunc("GET /v1/routes", s.need(authz.RoleSay, s.routes))
 	s.mux.HandleFunc("POST /v1/say", s.need(authz.RoleSay, s.say))
+	s.mux.HandleFunc("POST /v1/typing", s.need(authz.RoleSay, s.typing))
 	s.mux.HandleFunc("GET /v1/inbox", s.need(authz.RoleInbox, s.inbox))
 	s.mux.HandleFunc("POST /v1/inbox/ack", s.need(authz.RoleInbox, s.ack))
 	return s
@@ -191,6 +195,33 @@ func (s *Server) say(w http.ResponseWriter, r *http.Request) {
 	log.Printf("say by %s to %s (%d bytes)", identityOf(r).ClientID,
 		s.cfg.Routes.NameFor(chat), len(req.Text))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": s.cfg.Routes.NameFor(chat)})
+}
+
+// typing shows Telegram's "typing..." indicator to a recipient.
+//
+// Telegram clears it by itself after a few seconds, so a caller that wants it
+// to persist calls this repeatedly. That is deliberately the caller's job:
+// herald does not know how long anyone's work takes.
+func (s *Server) typing(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To string `json:"to"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	chat, err := s.cfg.Routes.Resolve(req.To)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := s.typingFn(ctx, chat); err != nil {
+		writeErr(w, http.StatusBadGateway, "telegram: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
