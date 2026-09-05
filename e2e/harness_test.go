@@ -105,6 +105,8 @@ type fakeTelegram struct {
 	mu       sync.Mutex
 	sent     []map[string]string
 	pending  []map[string]any
+	files    map[string][]byte // file_id -> bytes
+	paths    map[string]string // file_id -> telegram file_path
 	srv      *httptest.Server
 	polls    int
 	nextID   int64
@@ -112,11 +114,46 @@ type fakeTelegram struct {
 }
 
 func newTelegram(t *testing.T) *fakeTelegram {
-	f := &fakeTelegram{nextID: 100}
+	f := &fakeTelegram{nextID: 100, files: map[string][]byte{}, paths: map[string]string{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real Bot API serves file bytes from a different path than its
+		// methods: /file/bot<token>/<file_path>. Model that, so the client's
+		// URL construction is exercised rather than assumed.
+		if strings.HasPrefix(r.URL.Path, "/file/bot") {
+			rest := strings.TrimPrefix(r.URL.Path, "/file/bot")
+			slash := strings.Index(rest, "/")
+			if slash < 0 {
+				http.NotFound(w, r)
+				return
+			}
+			want := rest[slash+1:]
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for id, p := range f.paths {
+				if p == want {
+					w.Write(f.files[id])
+					return
+				}
+			}
+			http.NotFound(w, r)
+			return
+		}
 		_ = r.ParseForm()
 		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 		switch method {
+		case "getFile":
+			f.mu.Lock()
+			id := r.FormValue("file_id")
+			p, ok := f.paths[id]
+			size := len(f.files[id])
+			f.mu.Unlock()
+			if !ok {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ok": false, "error_code": 400, "description": "file not found"})
+				return
+			}
+			writeOK(w, map[string]any{"file_path": p, "file_size": size})
 		case "getMe":
 			writeOK(w, map[string]any{"username": "e2e_bot", "id": 1})
 		case "getUpdates":
@@ -165,6 +202,55 @@ func (f *fakeTelegram) deliver(chat int64, from, text string) {
 			"date":       time.Now().Unix(),
 			"chat":       map[string]any{"id": chat, "type": "private"},
 			"from":       map[string]any{"id": chat, "username": from},
+		},
+	})
+}
+
+// deliverPhoto queues an inbound photo, with several renditions the way
+// Telegram really sends them, so the largest-size choice is exercised.
+func (f *fakeTelegram) deliverPhoto(chat int64, from, caption string, big []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	small, large := "file-small", "file-large"
+	f.files[small] = []byte("thumbnail, not the one we want")
+	f.files[large] = big
+	f.paths[small] = "photos/small.jpg"
+	f.paths[large] = "photos/large.jpg"
+	msg := map[string]any{
+		"message_id": f.nextID,
+		"date":       time.Now().Unix(),
+		"chat":       map[string]any{"id": chat, "type": "private"},
+		"from":       map[string]any{"id": chat, "username": from},
+		"photo": []map[string]any{
+			{"file_id": small, "file_unique_id": "uniq-small", "width": 90, "height": 60, "file_size": len(f.files[small])},
+			{"file_id": large, "file_unique_id": "uniq-large", "width": 1280, "height": 853, "file_size": len(big)},
+		},
+	}
+	if caption != "" {
+		msg["caption"] = caption
+	}
+	f.pending = append(f.pending, map[string]any{"update_id": f.nextID, "message": msg})
+}
+
+// deliverBrokenPhoto announces a photo whose file_id resolves to nothing, the
+// shape of a real getFile failure.
+func (f *fakeTelegram) deliverBrokenPhoto(chat int64, from, caption string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	f.pending = append(f.pending, map[string]any{
+		"update_id": f.nextID,
+		"message": map[string]any{
+			"message_id": f.nextID,
+			"caption":    caption,
+			"date":       time.Now().Unix(),
+			"chat":       map[string]any{"id": chat, "type": "private"},
+			"from":       map[string]any{"id": chat, "username": from},
+			"photo": []map[string]any{
+				{"file_id": "no-such-file", "file_unique_id": "uniq-missing",
+					"width": 800, "height": 600, "file_size": 1234},
+			},
 		},
 	})
 }

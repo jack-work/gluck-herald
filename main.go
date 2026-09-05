@@ -26,6 +26,7 @@ import (
 	gauthz "github.com/jack-work/gluck-authz"
 	"github.com/jack-work/gluck-herald/client"
 	"github.com/jack-work/gluck-herald/internal/authz"
+	"github.com/jack-work/gluck-herald/internal/media"
 	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/server"
 	"github.com/jack-work/gluck-herald/internal/store"
@@ -41,6 +42,7 @@ Client:
   herald say --to <name> <markdown>   send a message ("-" reads stdin)
   herald inbox [--wait D]             print pending messages as JSON
   herald ack --through <id>           drop messages through an id
+  herald media <id> [-o <file>]       fetch one attachment ("-" writes stdout)
   herald routes                       list recipient names
   herald whoami                       show what your token asserts
   herald health                       server health (no auth)
@@ -69,6 +71,8 @@ func main() {
 		err = runInbox(os.Args[2:])
 	case "ack":
 		err = runAck(os.Args[2:])
+	case "media":
+		err = cmdMedia(os.Args[2:])
 	case "routes":
 		err = runRoutes(os.Args[2:])
 	case "whoami":
@@ -119,6 +123,7 @@ func runServe(args []string) error {
 	jwksURL := fs.String("jwks", envOr("HERALD_JWKS", "http://127.0.0.1:9091/jwks.json"), "Authelia JWKS URL")
 	issuer := fs.String("issuer", envOr("HERALD_ISSUER", "https://auth.kelliher.info"), "expected token issuer")
 	policyJSON := fs.String("policy", envOr("HERALD_POLICY", ""), `client roles, JSON: {"herald":["say","inbox","admin"]}`)
+	mediaDir := fs.String("media", envOr("HERALD_MEDIA", ""), "attachment directory (default: media/ beside the state file)")
 	routesJSON := fs.String("routes", envOr("HERALD_ROUTES", ""), `recipient names, JSON: {"gluck":"487734915"}`)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -161,9 +166,26 @@ func runServe(args []string) error {
 		return fmt.Errorf("telegram getMe: %w", err)
 	}
 
+	if strings.TrimSpace(*mediaDir) == "" {
+		*mediaDir = filepath.Join(filepath.Dir(*statePath), "media")
+	}
+
 	st, err := store.Open(*statePath)
 	if err != nil {
 		return err
+	}
+
+	// Media lives beside the state file, which puts it inside the unit's
+	// StateDirectory without the unit having to say so twice.
+	ms, err := media.Open(*mediaDir)
+	if err != nil {
+		return err
+	}
+	// The store is what knows when a message stops existing, so it is what
+	// releases the bytes: an attachment that outlives its message is a leak.
+	st.DropMedia = ms.Remove
+	if n := ms.Sweep(); len(n) > 0 {
+		log.Printf("media: swept %d expired object(s) at startup", len(n))
 	}
 
 	srv := server.New(server.Config{
@@ -171,6 +193,7 @@ func runServe(args []string) error {
 		Store:    st,
 		Policy:   policy,
 		Routes:   routes,
+		Media:    ms,
 		Verifier: &gauthz.Verifier{JWKSURL: *jwksURL, Issuer: *issuer, ClientIDs: policy.Clients()},
 	})
 
@@ -182,7 +205,8 @@ func runServe(args []string) error {
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	go server.Poll(ctx, bot, st, routes)
+	go server.Poll(ctx, bot, st, routes, ms)
+	go sweepMedia(ctx, ms)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -210,6 +234,47 @@ func defaultStatePath() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "state", "herald", "state.json")
+}
+
+// cmdMedia fetches one attachment by the id the inbox reported.
+//
+// It exists so the path can be exercised by hand, without a bridge and
+// without an aria: after a deploy, send a photo and fetch it. A feature that
+// can only be tested by the thing that consumes it is a feature nobody can
+// diagnose.
+func cmdMedia(args []string) error {
+	fs := flag.NewFlagSet("media", flag.ExitOnError)
+	out := fs.String("o", "", `write to this file, or "-" for stdout (default: the id, in the current directory)`)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: herald media <id> [-o <file>]")
+	}
+	id := fs.Arg(0)
+
+	dst := *out
+	if dst == "" {
+		dst = id
+	}
+	var w io.Writer = os.Stdout
+	if dst != "-" {
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	n, err := newClient().Media(ctx, id, w)
+	if err != nil {
+		return err
+	}
+	if dst != "-" {
+		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", dst, n)
+	}
+	return nil
 }
 
 // ---------- client ----------
@@ -364,4 +429,25 @@ func orEmptyJSON(s string) string {
 		return "{}"
 	}
 	return s
+}
+
+// sweepMedia enforces the age and size caps on a slow timer.
+//
+// It is a backstop, not the mechanism: attachments are normally released the
+// moment their message is acknowledged. This collects what a client that
+// stopped polling left behind, so an inbox nobody drains cannot fill the disk
+// of the machine that also routes the house.
+func sweepMedia(ctx context.Context, ms *media.Store) {
+	t := time.NewTicker(1 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if gone := ms.Sweep(); len(gone) > 0 {
+				log.Printf("media: swept %d object(s) past the retention caps", len(gone))
+			}
+		}
+	}
 }

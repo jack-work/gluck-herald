@@ -17,12 +17,33 @@ import (
 	"time"
 )
 
+// Media is a reference to an attachment herald has downloaded and holds.
+//
+// The reference travels in the message; the bytes do not. Base64 in a
+// long-polled JSON body would collide with the tunnel's ~100s ceiling on the
+// way out and land in the client's transcript as text on the way in, so the
+// client is told what exists and fetches it on a second, ordinary request.
+type Media struct {
+	ID       string `json:"id"`   // opaque, path-safe, stable per file
+	Kind     string `json:"kind"` // "photo" or "document"
+	Name     string `json:"name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	// Error records an attachment Telegram announced but would not hand
+	// over. It is delivered rather than swallowed: an aria told the image
+	// failed can ask for it again, while silence looks like nothing was sent.
+	Error string `json:"error,omitempty"`
+}
+
 // Message is one inbound Telegram message held for delivery.
 type Message struct {
 	ID       int64     `json:"id"` // the Telegram update_id: monotonic, unique
 	Chat     int64     `json:"chat"`
 	From     string    `json:"from"`
 	Text     string    `json:"text"`
+	Media    []Media   `json:"media,omitempty"`
 	Received time.Time `json:"received"`
 }
 
@@ -40,6 +61,14 @@ type Store struct {
 	// MaxInbox bounds retention: a client that never polls must not grow
 	// the file without limit. Oldest messages are dropped first.
 	MaxInbox int
+
+	// DropMedia releases the bytes belonging to messages that leave the
+	// inbox, whether by acknowledgement or by eviction.
+	//
+	// It lives here, on the one type that knows when a message stops
+	// existing, so that no caller has to remember: an attachment outliving
+	// its message is a leak, and a leak on the house router is a disk.
+	DropMedia func(ids ...string)
 }
 
 func Open(path string) (*Store, error) {
@@ -103,6 +132,7 @@ func (s *Store) Append(offset int64, msgs []Message) error {
 	s.st.Offset = offset
 	s.st.Inbox = append(s.st.Inbox, msgs...)
 	if n := len(s.st.Inbox) - s.MaxInbox; n > 0 {
+		s.dropMediaLocked(s.st.Inbox[:n])
 		s.st.Inbox = append([]Message{}, s.st.Inbox[n:]...)
 	}
 	if err := s.saveLocked(); err != nil {
@@ -140,13 +170,43 @@ func (s *Store) Ack(id int64) error {
 	defer s.mu.Unlock()
 
 	kept := s.st.Inbox[:0]
+	var gone []Message
 	for _, m := range s.st.Inbox {
 		if m.ID > id {
 			kept = append(kept, m)
+		} else {
+			gone = append(gone, m)
 		}
 	}
 	s.st.Inbox = append([]Message{}, kept...)
-	return s.saveLocked()
+	// Persist the shortened inbox before releasing the bytes. A crash
+	// between the two leaves an orphan file, which Sweep collects; the
+	// other order leaves a message pointing at a file that is gone, which
+	// nothing can repair.
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.dropMediaLocked(gone)
+	return nil
+}
+
+// dropMediaLocked releases the attachments of messages that have left the
+// inbox. The caller holds the mutex.
+func (s *Store) dropMediaLocked(msgs []Message) {
+	if s.DropMedia == nil {
+		return
+	}
+	var ids []string
+	for _, m := range msgs {
+		for _, md := range m.Media {
+			if md.ID != "" {
+				ids = append(ids, md.ID)
+			}
+		}
+	}
+	if len(ids) > 0 {
+		s.DropMedia(ids...)
+	}
 }
 
 // Wait returns a channel closed when new messages arrive, for long polling.

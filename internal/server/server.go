@@ -12,13 +12,16 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"mime"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 
 	gauthz "github.com/jack-work/gluck-authz"
 	"github.com/jack-work/gluck-herald/internal/authz"
+	mediaPkg "github.com/jack-work/gluck-herald/internal/media"
 	"github.com/jack-work/gluck-herald/internal/route"
 	"github.com/jack-work/gluck-herald/internal/store"
 	"github.com/jack-work/gluck-herald/internal/tg"
@@ -37,6 +40,7 @@ type Config struct {
 	Verifier *gauthz.Verifier
 	Policy   *authz.Policy
 	Routes   *route.Table
+	Media    *mediaPkg.Store
 }
 
 type Server struct {
@@ -68,6 +72,7 @@ func New(cfg Config) *Server {
 	s.mux.HandleFunc("POST /v1/typing", s.need(authz.RoleSay, s.typing))
 	s.mux.HandleFunc("GET /v1/inbox", s.need(authz.RoleInbox, s.inbox))
 	s.mux.HandleFunc("POST /v1/inbox/ack", s.need(authz.RoleInbox, s.ack))
+	s.mux.HandleFunc("GET /v1/media/{id}", s.need(authz.RoleInbox, s.media))
 	return s
 }
 
@@ -267,6 +272,43 @@ func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// media serves the bytes of one attachment.
+//
+// Herald hands back an id in the inbox and the bytes here, on a second
+// ordinary request, rather than base64 inside the long poll: the poll is held
+// open against a tunnel that closes at about 100 seconds, and image data
+// inlined in JSON lands in the client's transcript as text.
+//
+// An id herald does not hold is a 404, and so is an id whose message has been
+// acknowledged. The two are deliberately the same answer: herald reports what
+// it holds now, not what it once held. Nothing outside this store is
+// reachable, because a valid id is 32 hex characters and a short extension,
+// which cannot name a path.
+func (s *Server) media(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.cfg.Media == nil || !mediaPkg.ValidID(id) {
+		writeErr(w, http.StatusNotFound, "no such media")
+		return
+	}
+	f, fi, err := s.cfg.Media.Open(id)
+	if err != nil {
+		log.Printf("media %q requested by %s: %v", id, identityOf(r).ClientID, err)
+		writeErr(w, http.StatusNotFound, "no such media")
+		return
+	}
+	defer f.Close()
+
+	if ct := mime.TypeByExtension(path.Ext(id)); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	// Attachment, not inline: nothing here is meant to be rendered by a
+	// browser that wandered in.
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(id))
+	http.ServeContent(w, r, id, fi.ModTime(), f)
+}
+
 func (s *Server) ack(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Through int64 `json:"through"`
@@ -300,7 +342,7 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 // receives 409 Conflict and the two silently split the message stream. That
 // is a configuration error, not a transient one, so it is logged loudly
 // rather than retried quietly.
-func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Table) {
+func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Table, ms *mediaPkg.Store) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		ups, err := bot.GetUpdates(ctx, st.Offset())
@@ -333,7 +375,14 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Ta
 				offset = u.UpdateID + 1
 			}
 			m := u.Message
-			if m == nil || m.Body() == "" {
+			if m == nil {
+				continue
+			}
+			atts := m.Attachments()
+			// An uncaptioned photo has an empty body and is still a
+			// message. Dropping it was the bug: a screenshot sent with no
+			// words vanished without a trace anywhere.
+			if m.Body() == "" && len(atts) == 0 {
 				continue
 			}
 			if !routes.Allowed(m.Chat.ID) {
@@ -346,6 +395,7 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Ta
 				Chat:     m.Chat.ID,
 				From:     routes.NameFor(m.Chat.ID),
 				Text:     m.Body(),
+				Media:    fetchAll(ctx, bot, ms, atts),
 				Received: time.Unix(m.Date, 0).UTC(),
 			})
 		}
@@ -359,7 +409,53 @@ func Poll(ctx context.Context, bot *tg.Client, st *store.Store, routes *route.Ta
 			continue
 		}
 		for _, m := range msgs {
-			log.Printf("inbox += from=%s %d bytes", m.From, len(m.Text))
+			log.Printf("inbox += from=%s %d bytes, %d media", m.From, len(m.Text), len(m.Media))
 		}
 	}
+}
+
+// fetchAll downloads a message's attachments before the message is persisted.
+//
+// Downloading first is what makes the record honest: a message reaches the
+// inbox describing media herald actually holds, so a client that reads it can
+// fetch every id in it. An attachment that fails is still reported, carrying
+// its error, because an aria told the image failed can ask for it again while
+// silence looks like nothing was sent.
+func fetchAll(ctx context.Context, bot *tg.Client, ms *mediaPkg.Store, atts []tg.Attachment) []store.Media {
+	if len(atts) == 0 || ms == nil {
+		return nil
+	}
+	out := make([]store.Media, 0, len(atts))
+	for _, a := range atts {
+		ref := store.Media{
+			Kind: a.Kind, Name: a.Name, MimeType: a.MimeType,
+			Width: a.Width, Height: a.Height, Size: a.Size,
+		}
+		p, err := ms.Create()
+		if err != nil {
+			log.Printf("media: create failed: %v", err)
+			ref.Error = err.Error()
+			out = append(out, ref)
+			continue
+		}
+		n, filePath, err := bot.Download(ctx, a.FileID, p)
+		if err != nil {
+			p.Abort()
+			log.Printf("media: %s download failed: %v", a.Kind, err)
+			ref.Error = err.Error()
+			out = append(out, ref)
+			continue
+		}
+		id := mediaPkg.ID(a.FileUniqueID, path.Ext(filePath))
+		if err := p.Commit(id); err != nil {
+			log.Printf("media: commit failed: %v", err)
+			ref.Error = err.Error()
+			out = append(out, ref)
+			continue
+		}
+		ref.ID, ref.Size = id, n
+		log.Printf("media: stored %s %s (%d bytes)", a.Kind, id, n)
+		out = append(out, ref)
+	}
+	return out
 }

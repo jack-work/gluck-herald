@@ -174,11 +174,27 @@ func (c *Client) Routes(ctx context.Context) ([]string, error) {
 	return out.Routes, err
 }
 
+// Media is an attachment herald holds, described in the message and fetched
+// separately. The bytes never ride inside the inbox response: the poll is
+// held against a tunnel that closes at about 100 seconds, and image data
+// inlined as base64 would land in the caller's transcript as text.
+type Media struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Name     string `json:"name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
 type Message struct {
 	ID       int64     `json:"id"`
 	Chat     int64     `json:"chat"`
 	From     string    `json:"from"`
 	Text     string    `json:"text"`
+	Media    []Media   `json:"media,omitempty"`
 	Received time.Time `json:"received"`
 }
 
@@ -197,6 +213,32 @@ func (c *Client) Inbox(ctx context.Context, after int64, wait time.Duration) ([]
 	}
 	err := c.do(ctx, http.MethodGet, "/v1/inbox?"+q.Encode(), nil, &out, false)
 	return out.Messages, err
+}
+
+// Media writes one attachment's bytes to w.
+//
+// Fetch before acknowledging: the acknowledgement is what releases the bytes,
+// so an id fetched afterwards is a 404 by design rather than by accident.
+func (c *Client) Media(ctx context.Context, id string, w io.Writer) (int64, error) {
+	tok, err := c.Tokens.Token(ctx)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.BaseURL+"/v1/media/"+url.PathEscape(id), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("media %s: http %d", id, resp.StatusCode)
+	}
+	return io.Copy(w, resp.Body)
 }
 
 // Ack drops messages through id. Delivery is at-least-once: acknowledge

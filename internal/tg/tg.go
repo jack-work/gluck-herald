@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -147,11 +148,34 @@ type Update struct {
 	Message  *Message `json:"message"`
 }
 
+// PhotoSize is one rendition of a photo. Telegram sends an array of them,
+// smallest first, and they are the same image at different scales.
+type PhotoSize struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	FileSize     int64  `json:"file_size"`
+}
+
+// Document is a file sent as an attachment rather than as a photo. A
+// screenshot sent with "send as file" arrives here and not in Photo, which is
+// why both paths exist.
+type Document struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id"`
+	FileName     string `json:"file_name"`
+	MimeType     string `json:"mime_type"`
+	FileSize     int64  `json:"file_size"`
+}
+
 type Message struct {
-	MessageID int64  `json:"message_id"`
-	Text      string `json:"text"`
-	Caption   string `json:"caption"`
-	Date      int64  `json:"date"`
+	MessageID int64       `json:"message_id"`
+	Text      string      `json:"text"`
+	Caption   string      `json:"caption"`
+	Photo     []PhotoSize `json:"photo"`
+	Document  *Document   `json:"document"`
+	Date      int64       `json:"date"`
 	Chat      struct {
 		ID       int64  `json:"id"`
 		Type     string `json:"type"`
@@ -170,6 +194,50 @@ func (m *Message) Body() string {
 		return t
 	}
 	return strings.TrimSpace(m.Caption)
+}
+
+// Attachment is one downloadable thing hanging off a message, flattened so
+// callers do not care whether it arrived as a photo or as a document.
+type Attachment struct {
+	FileID       string
+	FileUniqueID string
+	Kind         string // "photo" or "document"
+	Name         string // suggested filename, may be empty
+	MimeType     string
+	Width        int
+	Height       int
+	Size         int64
+}
+
+// Attachments returns what the message carries, largest photo rendition only.
+//
+// Telegram's photo array is one image at several scales; downloading every
+// size would spend the disk and the round trips to store the same picture
+// four times. The largest is the one worth keeping: an aria reading a
+// screenshot needs the pixels the text was rendered at.
+func (m *Message) Attachments() []Attachment {
+	var out []Attachment
+	if len(m.Photo) > 0 {
+		best := m.Photo[0]
+		for _, p := range m.Photo {
+			if p.Width*p.Height > best.Width*best.Height {
+				best = p
+			}
+		}
+		out = append(out, Attachment{
+			FileID: best.FileID, FileUniqueID: best.FileUniqueID,
+			Kind: "photo", Name: "photo.jpg", MimeType: "image/jpeg",
+			Width: best.Width, Height: best.Height, Size: best.FileSize,
+		})
+	}
+	if m.Document != nil && m.Document.FileID != "" {
+		out = append(out, Attachment{
+			FileID: m.Document.FileID, FileUniqueID: m.Document.FileUniqueID,
+			Kind: "document", Name: m.Document.FileName,
+			MimeType: m.Document.MimeType, Size: m.Document.FileSize,
+		})
+	}
+	return out
 }
 
 // GetUpdates long-polls for messages newer than offset.
@@ -252,4 +320,68 @@ func Chunk(s string, limit int) []string {
 		out = append(out, rest)
 	}
 	return out
+}
+
+// MaxDownload bounds what one attachment may write to disk.
+//
+// Telegram caps bot downloads near 20MB, but the ceiling is ours to enforce
+// rather than theirs to promise: a lying Content-Length must not be able to
+// fill the disk of the machine that is also the house router.
+const MaxDownload = 25 << 20
+
+// fileBase is the download host, which is a different path from the API.
+// Telegram serves calls at /bot<token>/<method> and file bytes at
+// /file/bot<token>/<file_path>.
+func (c *Client) fileBase() string {
+	return strings.TrimSuffix(c.base, "bot") + "file/bot"
+}
+
+// Download resolves a file_id and writes the bytes to w, returning the count
+// and the file_path Telegram reported (whose extension is the only honest
+// hint about the format).
+//
+// Two calls, because the Bot API offers no single one: getFile mints a
+// short-lived path, then the bytes come from the file host.
+func (c *Client) Download(ctx context.Context, fileID string, w io.Writer) (int64, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var meta struct {
+		FilePath string `json:"file_path"`
+		FileSize int64  `json:"file_size"`
+	}
+	if err := c.call(ctx, "getFile", url.Values{"file_id": {fileID}}, &meta); err != nil {
+		return 0, "", err
+	}
+	if meta.FilePath == "" {
+		return 0, "", fmt.Errorf("getFile: telegram returned no file_path")
+	}
+	if meta.FileSize > MaxDownload {
+		return 0, "", fmt.Errorf("file is %d bytes, over the %d limit", meta.FileSize, MaxDownload)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.fileBase()+c.token+"/"+meta.FilePath, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, "", fmt.Errorf("download: http %d", resp.StatusCode)
+	}
+
+	// LimitReader at the cap plus one: reading one byte past it is how an
+	// oversized body is detected without trusting the header that declared it.
+	n, err := io.Copy(w, io.LimitReader(resp.Body, MaxDownload+1))
+	if err != nil {
+		return n, meta.FilePath, err
+	}
+	if n > MaxDownload {
+		return n, meta.FilePath, fmt.Errorf("file exceeded %d bytes", MaxDownload)
+	}
+	return n, meta.FilePath, nil
 }
