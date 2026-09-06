@@ -385,3 +385,33 @@ func (c *Client) Download(ctx context.Context, fileID string, w io.Writer) (int6
 	}
 	return n, meta.FilePath, nil
 }
+
+// Command is one entry in the menu Telegram shows behind the slash key.
+type Command struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetCommands replaces the bot's command menu.
+//
+// The list lives on Telegram's side, not ours: it survives restarts,
+// redeploys and the deletion of whatever registered it. A previous tenant of
+// this bot token left its own commands there, and they outlived the program
+// by months because nothing ever overwrote them. So herald sets the list at
+// startup rather than offering a command to do it: a menu that is only
+// correct when someone remembers to correct it is the thing that failed.
+func (c *Client) SetCommands(ctx context.Context, cmds []Command) error {
+	b, err := json.Marshal(cmds)
+	if err != nil {
+		return err
+	}
+	return c.call(ctx, "setMyCommands", url.Values{"commands": {string(b)}}, nil)
+}
+
+// Commands reports what Telegram currently has registered, which is the only
+// way to see what a previous tenant left behind.
+func (c *Client) Commands(ctx context.Context) ([]Command, error) {
+	var out []Command
+	err := c.call(ctx, "getMyCommands", url.Values{}, &out)
+	return out, err
+}

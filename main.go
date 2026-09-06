@@ -166,6 +166,23 @@ func runServe(args []string) error {
 		return fmt.Errorf("telegram getMe: %w", err)
 	}
 
+	// Register the command menu every start. Telegram stores it, so it
+	// outlives the program that set it: this bot token still carried a
+	// previous tenant's commands long after that program was gone. Setting
+	// it here makes the menu a property of the running code rather than of
+	// whoever last remembered.
+	if before, err := bot.Commands(ctx); err == nil {
+		if !sameCommands(before, botCommands) {
+			if err := bot.SetCommands(ctx, botCommands); err != nil {
+				log.Printf("setMyCommands: %v (menu may be stale)", err)
+			} else {
+				log.Printf("commands: replaced %d stale entr(ies) with %d current", len(before), len(botCommands))
+			}
+		}
+	} else {
+		log.Printf("getMyCommands: %v", err)
+	}
+
 	if strings.TrimSpace(*mediaDir) == "" {
 		*mediaDir = filepath.Join(filepath.Dir(*statePath), "media")
 	}
@@ -275,6 +292,35 @@ func cmdMedia(args []string) error {
 		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", dst, n)
 	}
 	return nil
+}
+
+// botCommands is the menu Telegram shows behind the slash key.
+//
+// It names what exists now: figaro arias reached through the bridge. Nothing
+// here is kept for compatibility with an older spelling, because nothing
+// depends on those but habit, and a menu offering commands that do nothing is
+// worse than a short one.
+var botCommands = []tg.Command{
+	{Command: "aria", Description: "which aria this chat is bound to"},
+	{Command: "arias", Description: "recent arias to choose from"},
+	{Command: "bind", Description: "point this chat at an aria or @role"},
+	{Command: "new", Description: "mint a fresh aria and bind to it"},
+	{Command: "roles", Description: "roles and who holds them"},
+	{Command: "hup", Description: "stop the running turn, keep anything queued"},
+	{Command: "cut", Description: "stop it and discard the queue, handed back to you"},
+	{Command: "help", Description: "what these do"},
+}
+
+func sameCommands(a, b []tg.Command) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------- client ----------

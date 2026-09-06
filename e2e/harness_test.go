@@ -105,6 +105,8 @@ type fakeTelegram struct {
 	mu       sync.Mutex
 	sent     []map[string]string
 	pending  []map[string]any
+	stale    []map[string]string // what a previous tenant left registered
+	setCmds  [][]map[string]string
 	files    map[string][]byte // file_id -> bytes
 	paths    map[string]string // file_id -> telegram file_path
 	srv      *httptest.Server
@@ -141,6 +143,19 @@ func newTelegram(t *testing.T) *fakeTelegram {
 		_ = r.ParseForm()
 		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 		switch method {
+		case "getMyCommands":
+			f.mu.Lock()
+			cur := f.stale
+			f.mu.Unlock()
+			writeOK(w, cur)
+		case "setMyCommands":
+			var got []map[string]string
+			_ = json.Unmarshal([]byte(r.FormValue("commands")), &got)
+			f.mu.Lock()
+			f.setCmds = append(f.setCmds, got)
+			f.stale = got
+			f.mu.Unlock()
+			writeOK(w, true)
 		case "getFile":
 			f.mu.Lock()
 			id := r.FormValue("file_id")

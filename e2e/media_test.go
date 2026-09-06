@@ -321,3 +321,86 @@ type staticToken string
 
 func (s staticToken) Token(context.Context) (string, error)   { return string(s), nil }
 func (s staticToken) Refresh(context.Context) (string, error) { return string(s), nil }
+
+// Telegram stores the command menu on its own side, so it outlives whatever
+// registered it. This bot token carried a previous tenant's commands for
+// months because nothing overwrote them. Herald replaces the menu at every
+// start, which makes it a property of the running code.
+func TestStaleCommandMenuIsReplacedAtStartup(t *testing.T) {
+	idp := newIDP(t)
+	tel := newTelegram(t)
+	tel.stale = []map[string]string{
+		{"command": "clear", "description": "openclaw: clear the session"},
+		{"command": "model", "description": "openclaw: switch model"},
+	}
+	startHerald(t, idp, tel)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tel.mu.Lock()
+		n := len(tel.setCmds)
+		var last []map[string]string
+		if n > 0 {
+			last = tel.setCmds[n-1]
+		}
+		tel.mu.Unlock()
+		if n > 0 {
+			names := map[string]bool{}
+			for _, c := range last {
+				names[c["command"]] = true
+			}
+			if names["clear"] || names["model"] {
+				t.Fatalf("the previous tenant's commands survived: %+v", last)
+			}
+			for _, want := range []string{"hup", "cut", "arias", "bind"} {
+				if !names[want] {
+					t.Errorf("menu is missing /%s: %+v", want, last)
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("herald never registered a command menu")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// Setting the menu on every start would be noise if it never changed, so it
+// is written only when it differs. A restart against a correct menu must be
+// silent.
+func TestCommandMenuIsNotRewrittenWhenAlreadyCorrect(t *testing.T) {
+	idp := newIDP(t)
+	tel := newTelegram(t)
+	startHerald(t, idp, tel)
+	waitForCommands(t, tel, 1)
+
+	// A second herald sees the menu the first one left, which is correct,
+	// and must leave it alone.
+	startHerald(t, idp, tel)
+	time.Sleep(2 * time.Second)
+
+	tel.mu.Lock()
+	n := len(tel.setCmds)
+	tel.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("menu was written %d times; a matching menu must not be rewritten", n)
+	}
+}
+
+func waitForCommands(t *testing.T, tel *fakeTelegram, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tel.mu.Lock()
+		n := len(tel.setCmds)
+		tel.mu.Unlock()
+		if n >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d command registrations, want %d", n, want)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
